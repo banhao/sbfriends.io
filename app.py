@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 # Author: banhao@gmail.com
-# Version: 2.0 (Integrated Grok AI)
-# Issue Date: DECEMBER 27, 2025
-# Release Note: Added AI analysis button and Grok API integration
+# Version: 3.0 
+# Issue Date: March 15, 2026
+# Release Note: "QUESTRADE" supply the SEC data
 
 from waitress import serve
 from flask import Flask, request, jsonify, render_template
@@ -15,8 +15,12 @@ import requests
 import pandas as pd
 import pandas_ta as ta
 import numpy as np
+import re
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
+from pathlib import Path
+import time
+from threading import Lock
 
 # Load environment variables
 load_dotenv()
@@ -24,6 +28,79 @@ SEC_URL = os.getenv('SEC_URL')
 CRYPTO_URL = os.getenv('CRYPTO_URL')
 FINANCIAL_API_KEY = os.getenv('FINANCIAL_API_KEY')
 XAI_API_KEY = os.getenv('XAI_API_KEY')
+QUESTRADE_TOKEN = os.getenv('QUESTRADE_TOKEN')
+
+# Global token state
+_token_lock = Lock()
+_access_token = None
+_token_expires_at = 0          # unix timestamp
+_api_server = None
+_current_refresh_token = QUESTRADE_TOKEN
+
+def refresh_questrade_token(force=False):
+    """
+    Refreshes access_token if expired or force=True.
+    Updates globals + .env with new refresh_token.
+    Returns (access_token, api_server) or raises exception.
+    """
+    global _access_token, _token_expires_at, _api_server, _current_refresh_token
+    with _token_lock:
+        now = time.time()
+        if not force and _access_token and now < _token_expires_at - 300:  # 5 min buffer
+            return _access_token, _api_server
+        print("Refreshing Questrade token...")
+        try:
+            resp = requests.post(  # ← use POST (more correct than GET for token endpoint)
+                "https://login.questrade.com/oauth2/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": _current_refresh_token
+                },
+                timeout=15
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            new_access = data["access_token"]
+            new_refresh = data["refresh_token"]
+            expires_in = int(data["expires_in"])          # usually 1800
+            new_api_server = data["api_server"]
+            # Update globals
+            _access_token = new_access
+            _api_server = new_api_server
+            _token_expires_at = now + expires_in
+            _current_refresh_token = new_refresh   # rotation!
+            # Update .env (atomic-ish replace)
+            env_path = Path(".env")
+            if env_path.exists():
+                content = env_path.read_text(encoding="utf-8")
+                new_content = re.sub(
+                    r'^(QUESTRADE_TOKEN=).*$',
+                    lambda m: m.group(1) + new_refresh,
+                    content,
+                    flags=re.MULTILINE | re.IGNORECASE
+                )
+                env_path.write_text(new_content, encoding="utf-8")
+                print("Updated .env with new refresh_token")
+            print(f"Token refreshed. Expires in {expires_in}s")
+            return new_access, new_api_server
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code in (400, 401):
+                msg = e.response.text or "Invalid/expired refresh token"
+                raise RuntimeError(f"Questrade refresh failed (likely bad refresh_token): {msg}") from e
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Token refresh failed: {str(e)}") from e
+
+
+#QUESTRADE_TOKEN = os.getenv('QUESTRADE_TOKEN')
+#TOKEN_RESPONSE = requests.get(f"https://login.questrade.com/oauth2/token?grant_type=refresh_token&refresh_token={QUESTRADE_TOKEN}").json()
+#ACCESS_TOKEN = TOKEN_RESPONSE["access_token"]
+#REFRESH_TOKEN = TOKEN_RESPONSE["refresh_token"]
+#API_URL = TOKEN_RESPONSE["api_server"]
+#env_path = Path(".env")
+#content = env_path.read_text(encoding="utf-8")
+#new_content = re.sub(r'^(QUESTRADE_TOKEN=).*$',rf'\1{REFRESH_TOKEN}',content,flags=re.MULTILINE)
+#env_path.write_text(new_content, encoding="utf-8")
 
 # conf.get_default().region = "us"
 
@@ -71,7 +148,7 @@ index_html_template = """
             display: flex;
             z-index: 100;
             flex-direction: column;
-            gap: 10px;
+            gap: 8px;
             box-shadow: 2px 0 5px rgba(0, 0, 0, 0.1);
             overflow-y: auto; /* Scroll sidebar if content overflows */
         }}
@@ -517,6 +594,9 @@ index_html_template = """
         function openStockHeatmap() {{
             window.open('https://www.tradingview.com/heatmap/stock/#%7B%22dataSource%22%3A%22AllUSA%22%2C%22blockColor%22%3A%22change%22%2C%22blockSize%22%3A%22market_cap_basic%22%2C%22grouping%22%3A%22sector%22%7D', '_blank', 'width=1024,height=768,toolbar=no,location=no,status=no,menubar=no,resizable=yes');
         }}
+        function openFearandGreed() {{
+            window.open('https://coinmarketcap.com/charts/fear-and-greed-index/', '_blank', 'width=1024,height=768,toolbar=no,location=no,status=no,menubar=no,resizable=yes');
+        }}
         function OHLCprices() {{
             // Ensure sidebar is hidden and content is full-screen on mobile
             if (isMobileDevice()) {{
@@ -528,18 +608,67 @@ index_html_template = """
             }}
             var selectedTicker = document.getElementById("tickers").value;
             var selectedCategory = document.getElementById("category").value;
-            var interval = document.getElementById("interval").value;
-            var intervalMultiplier = document.getElementById("interval_multiplier").value;
+            var intervalRaw = document.getElementById("interval").value;
             var startDate = document.getElementById("start_date").value;
             var endDate = document.getElementById("end_date").value;
             var bollingerDeltaWindow = document.getElementById("bollinger_delta_window").value;
             var indicatorsSelect = document.getElementById("indicators");
             var selectedIndicators = Array.from(indicatorsSelect.selectedOptions).map(option => option.value);
             var resultArea = document.getElementById("result");
-            if (!selectedTicker || !selectedCategory || !interval || !intervalMultiplier || !startDate || !endDate) {{
+        
+            // ── Parse interval for CRYPTO ───────────────────────────────────────
+            var interval = null;
+            var intervalMultiplier = 1;
+        
+            if (selectedCategory === "CRYPTO") {{
+                // Extract number and unit
+                var match = intervalRaw.match(/^(\\d+)([mhDWY])$/i);
+                if (!match) {{
+                    alert("Invalid interval format.");
+                    return;
+                }}
+        
+                var num = parseInt(match[1], 10);
+                var unit = match[2].toUpperCase();
+        
+                if (unit === 'H') {{
+                    interval = "minute";
+                    intervalMultiplier = num * 60;
+                }}else if (unit === 'D') {{
+                    interval = "day";
+                    intervalMultiplier = num;
+                }} else if (unit === 'W') {{
+                    interval = "week";
+                    intervalMultiplier = num;
+                }} else if (unit === 'M') {{
+                    interval = "month";
+                    intervalMultiplier = num;
+                }} else {{
+                    alert("Unsupported interval unit.");
+                    return;
+                }}
+            }} else {{
+                var unitMap = {{
+                    '1h':  'OneHour',
+                    '4h':  'FourHours',
+                    '1D':  'OneDay',
+                    '1W':  'OneWeek',
+                    '1M':  'OneMonth',
+                    '1Y':  'OneYear'
+                }};
+
+                interval = unitMap[intervalRaw] || intervalRaw;  // fallback to raw if no mapping
+                // Optional: warn if unknown format
+                if (!unitMap[intervalRaw]) {{
+                    console.warn("Unknown SEC interval format:", intervalRaw, "→ using as-is");
+                }}
+            }}
+            
+            if (!selectedTicker || !selectedCategory || !intervalRaw || !intervalMultiplier || !startDate || !endDate) {{
                 alert("⚠️ Please fill all fields before submitting.");
                 return;
             }}
+            
             const endpoint = selectedCategory === "CRYPTO" ? "/crypto/prices" : "/prices";
             resultArea.innerHTML = "Loading...";
             document.getElementById('chart').innerHTML = ""; // Clear the chart while loading
@@ -843,15 +972,12 @@ index_html_template = """
     </select>
     <label for="interval">Interval:</label>
     <select id="interval">
-        <option value="second">Second</option>
-        <option value="minute">Minute</option>
-        <option value="day" selected>Day</option>
-        <option value="week">Week</option>
-        <option value="month">Month</option>
-        <option value="year">Year</option>
+        <option value="1h" selected>1 Hour</option>
+        <option value="4h" selected>4 Hours</option>
+        <option value="1D" selected>1 Day</option>
+        <option value="1W">1 Week</option>
+        <option value="1M">1 Month</option>
     </select>
-    <label for="interval_multiplier">Interval Multiplier:</label>
-    <input type="number" id="interval_multiplier" min="1" step="1" value="1">
     <label for="start_date">Start Date:</label>
     <input type="date" id="start_date">
     <label for="end_date">End Date:</label>
@@ -912,8 +1038,12 @@ index_html_template = """
     </div>
     <a class="heatmap-link" href="javascript:void(0)" onclick="openStockHeatmap()">Stock Heatmap</a>
     <a class="heatmap-link" href="javascript:void(0)" onclick="openCryptoHeatmap()">Crypto Heatmap</a>
-    <div >
-        <label style="font-size: 12px; font-family: Arial, sans-serif;">data source "financialdatasets.ai"</label>
+    <a class="heatmap-link" href="javascript:void(0)" onclick="openFearandGreed()">Crypto Fear and Greed Index</a>
+    <div>
+        <label style="font-size: 9px; font-family: Arial, sans-serif;">SEC data is from "QuesTrade"</label>
+    </div>
+    <div>
+        <label style="font-size: 9px; font-family: Arial, sans-serif;">CRYPTO data is from "financialdatasets.ai"</label>
     </div>
 </div>
 <div class="content">
@@ -959,37 +1089,72 @@ app.secret_key = os.urandom(24)  # For session security
 # Helper function to fetch OHLC prices
 def OHLC_PRICES(category, ticker, interval, interval_multiplier, start_date, end_date):
     if category == "SEC":
-        url = "https://api.financialdatasets.ai/prices"
+        access_token, api_server = refresh_questrade_token()
+        api_server = api_server.rstrip('/')
+        print(api_server)
+        url = f"{api_server}/v1/symbols/search?prefix={ticker}"
+        print(url)
+        headers = {"Authorization": f"Bearer {access_token}"}
+        symbol_response = requests.get(url,headers=headers).json()
+        symbolId = symbol_response['symbols'][0]['symbolId']
+        url = f"{api_server}/v1/markets/candles/{symbolId}?startTime={start_date}T00:00:00-05:00&endTime={end_date}T23:59:59-05:00&interval={interval}"
+        print(f"Questrade candles request: {url} ")
+        try:
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            print(f"API response status: {response.status_code}")
+            data = response.json()
+            # print(f"API response: {data}")
+            # Check if the API response indicates the ticker is invalid
+            if "candles" not in data or not data["candles"]:
+                return {"error": f"No candle data returned for {ticker}"}
+            normalized = []
+            for c in data["candles"]:
+                normalized.append({
+                    "time": c["start"],          # or c["end"] if preferred
+                    "open": c["open"],
+                    "high": c["high"],
+                    "low": c["low"],
+                    "close": c["close"],
+                    "volume": c.get("volume", 0)
+                })
+            return {"prices": normalized}
+        except requests.exceptions.RequestException as e:
+            print(f"API request failed: {str(e)}")
+            # Check if the error indicates the ticker is invalid (e.g., 404 Not Found)
+            if "404" in str(e) or "not found" in str(e).lower():
+                return {"error": f"Ticker {ticker if category == 'SEC' else ticker} data does not exist"}
+            return {"error": str(e)}    
     elif category == "CRYPTO":
         url = "https://api.financialdatasets.ai/crypto/prices"
+        headers = {"X-API-KEY": FINANCIAL_API_KEY}
+        querystring = {
+            "limit": "5000",
+            "ticker": ticker,
+            "interval": interval,
+            "interval_multiplier": interval_multiplier,
+            "start_date": start_date,
+            "end_date": end_date
+        }
+        print(f"Calling API: {url} with params: {querystring}")
+        try:
+            response = requests.get(url, headers=headers, params=querystring)
+            response.raise_for_status()
+            print(f"API response status: {response.status_code}")
+            data = response.json()
+            # print(f"API response: {data}")
+            # Check if the API response indicates the ticker is invalid
+            if "error" in data and "not found" in data["error"].lower():
+                return {"error": f"Ticker {ticker if category == 'CRYPTO' else ticker} data does not exist"}
+            return data
+        except requests.exceptions.RequestException as e:
+            print(f"API request failed: {str(e)}")
+            # Check if the error indicates the ticker is invalid (e.g., 404 Not Found)
+            if "404" in str(e) or "not found" in str(e).lower():
+                return {"error": f"Ticker {ticker if category == 'CRYPTO' else ticker} data does not exist"}
+            return {"error": str(e)}
     else:
         return {"error": "Invalid category"}
-    querystring = {
-        "limit": "5000",
-        "ticker": ticker,
-        "interval": interval,
-        "interval_multiplier": interval_multiplier,
-        "start_date": start_date,
-        "end_date": end_date
-    }
-    headers = {"X-API-KEY": FINANCIAL_API_KEY}
-    print(f"Calling API: {url} with params: {querystring}")
-    try:
-        response = requests.get(url, headers=headers, params=querystring)
-        response.raise_for_status()
-        print(f"API response status: {response.status_code}")
-        data = response.json()
-        # print(f"API response: {data}")
-        # Check if the API response indicates the ticker is invalid
-        if "error" in data and "not found" in data["error"].lower():
-            return {"error": f"Ticker {ticker if category == 'CRYPTO' else ticker} data does not exist"}
-        return data
-    except requests.exceptions.RequestException as e:
-        print(f"API request failed: {str(e)}")
-        # Check if the error indicates the ticker is invalid (e.g., 404 Not Found)
-        if "404" in str(e) or "not found" in str(e).lower():
-            return {"error": f"Ticker {ticker if category == 'CRYPTO' else ticker} data does not exist"}
-        return {"error": str(e)}
 
 # Helper function to calculate Bollinger Delta
 def BOLLINGER_DELTA(window, serial_data):
@@ -1237,9 +1402,10 @@ def get_ohlc_prices():
         return jsonify({"error": "Invalid category. Must be 'SEC' or 'CRYPTO'"}), 400
 
     # Validate interval
-    valid_intervals = ["second", "minute", "day", "week", "month", "year"]
-    if interval not in valid_intervals:
-        return jsonify({"error": f"Invalid interval. Must be one of {valid_intervals}"}), 400
+    if category == "CRYPTO":
+        valid_intervals = ["second", "minute", "day", "week", "month", "year"]
+        if interval not in valid_intervals:
+            return jsonify({"error": f"Invalid interval. Must be one of {valid_intervals}"}), 400
 
     # Validate interval multiplier
     try:
@@ -1300,8 +1466,8 @@ def get_ohlc_prices():
 #        return None
 
 if __name__ == "__main__":
-    #serve(app, host="127.0.0.1", port=5000)                   # PROD mode
-    app.run(host="0.0.0.0", port=5000, debug=True)           # DEV mode
+    #serve(app, host="127.0.0.1", port=5000)                   # DEV mode
+    app.run(host="0.0.0.0", port=5000, debug=True)           # PROD mode
     # webhook_url = start_ngrok()
     # if webhook_url:
     #     from waitress import serve
