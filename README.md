@@ -1,7 +1,7 @@
 # **Use "QuesTrade" as SEC data source.**
-# **Use "financialdatasets.ai" as CRYPTO data source.**
+# **"financialdatasets.ai" terminated the CRYPTO PRICE API, Not recommended to use their data services.**
 
-The source data is from "financialdatasets.ai", if you want to use the other source data, you need change the code and the API KEY.
+If you want to use the other source data, you need change the code and the API KEY.
 
 And also if you want to change the Grok AI to the other AI, please change the code and the API KEY.
 
